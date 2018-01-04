@@ -50,6 +50,46 @@ def GS(H, method = 'dense'):
 		return U[:, 0]
 	else:
 		raise ValueError('method must be "dense" or "sparse".')
+def rexp(M):
+	w, U = numpy.linalg.eigh(M)
+	w = numpy.exp(- w)
+	w /= numpy.sum(w)
+	return U.dot(numpy.diag(w)).dot(U.transpose())
+def reln(P):
+	w, U = numpy.linalg.eigh(P)
+	w = - numpy.log(w)
+	w -= numpy.min(w)
+	return U.dot(numpy.diag(w)).dot(U.transpose())
+def f(x):
+	# f(x) = arctanh(x)/x
+	if abs(x) < 0.01:
+		x2 = x**2
+		return (4*x2-15)/(9*x2-15)
+	else:
+		return numpy.arctanh(x)/x
+f = numpy.vectorize(f)
+def B(p):
+	l = len(p)
+	pL = numpy.tile(p,(l,1))
+	pR = pL.transpose()
+	pM = (pL + pR)/2
+	eps = (pL - pR)/pM/2
+	return f(eps)/pM
+class Xent(torch.autograd.Function):
+	# Xent(P0, P1) = - Tr P0.ln(P1)
+	def forward(self, P0, P1):
+		self.p1, self.V = torch.symeig(P1, eigenvectors = True)
+		self.lnp1 = torch.log(self.p1)
+		xent = - torch.sum(torch.sum(self.V * P0.mm(self.V), 0)*self.lnp1, 0)
+		self.save_for_backward(P0, P1)
+		return xent
+	def backward(self, grad):
+		P0, P1 = self.saved_tensors
+		dP0 = self.V.mm(torch.diag(self.lnp1)).mm(self.V.t())
+		dP1 = self.V.t().mm(P0).mm(self.V)
+		dP1.mul_(torch.Tensor(B(self.p1.numpy())))
+		dP1 = self.V.mm(dP1).mm(self.V.t())
+		return (-grad * dP0, -grad * dP1)
 # ================ PHYSICS =================
 # Pauli operator class ---------------------
 class Pauli:
@@ -115,7 +155,7 @@ class Model:
 		self.opdim = len(self.ops) # operator space dimension
 		self.dim = 2**self.L # Hilbert space dimension
 	def __repr__(self):
-		return '[Model %d sites, %d local operators]'%(self.L, self.dim)
+		return '[Model %d sites, %d local operators]'%(self.L, self.opdim)
 	def build_ops(self):
 		# build the set of local operators
 		ks = list(range(min(self.loc, self.L)))
@@ -154,7 +194,7 @@ class MPSunit:
 		self.right = None
 		self.left_dim, self.right_dim, self.phys_dim = tensor.shape
 	def __repr__(self):
-		return '[MPS unit %d, %d, %d]'%(self.left_dim, self.right_dim, self.phys_dim)
+		return '[MPS unit %d×%d×%d]'%(self.left_dim, self.right_dim, self.phys_dim)
 	def pin(self, phys_env):
 		# pin the physical leg to phys_env
 		self.phys_env = phys_env # keep the physical environment
@@ -169,28 +209,34 @@ class MPSunit:
 # MPS class --------------------------------
 # specialized to the double ended MPS that looks like TTTTT
 class MPS:
-	def __init__(self, length, dim, max_dim = 8, lr = 0.01):
-		self.length = length # MPS chain length
+	def __init__(self, depth, dim, width = 8, lr = 0.002):
+		self.depth = depth # MPS chain length
 		# dim must match model's operator space dimension
 		self.left_dim = dim
 		self.right_dim = dim
 		self.phys_dim = dim + 1
-		self.max_dim = max_dim # max bond dimension
+		self.max_dim = width # max bond dimension
 		self.leftend = None
 		self.rightend = None
 		self.assemble()
 		self.P = torch.autograd.Variable(torch.zeros(dim, dim), requires_grad = True)
 		self.optimizer = MPSAdam([self.P], lr = lr) # optimizer
 	def __repr__(self):
-		return '[MPS %d, %d, (%d)^%d]'%(self.left_dim, self.right_dim, self.phys_dim, self.length)
+		return '[MPS of shape %d×(%d^%d)×%d]'%(self.left_dim, self.phys_dim, self.depth, self.right_dim)
+	def __iter__(self):
+		# make MPS an iterator such that units can iterate through in for loop
+		unit = self.leftend
+		while unit is not None:
+			yield unit
+			unit = unit.right
 	def assemble(self):
 		# set an default auxiliary dimension
 		dim = min(max(self.left_dim, self.right_dim), self.max_dim)
-		for i in range(self.length):
+		for i in range(self.depth):
 			if i == 0: # left end unit
 				unit = MPSunit(numpy.empty((self.left_dim, dim, self.phys_dim)))
 				self.leftend = unit
-			elif i == self.length - 1: # right end unit
+			elif i == self.depth - 1: # right end unit
 				unit.right = MPSunit(numpy.empty((dim, self.right_dim, self.phys_dim)))
 				unit.right.left = unit
 				unit = unit.right
@@ -198,22 +244,18 @@ class MPS:
 				unit.right = MPSunit(numpy.empty((dim, dim, self.phys_dim)))
 				unit.right.left = unit
 				unit = unit.right
-			if i == self.length - 1:
+			if i == self.depth - 1:
 				self.rightend = unit
 	def initialize(self, val):
 		# initialize MPS such that when all physical legs are pinned to [1,0,0,...], the MPS is simply a two-way multiplier with multiplication factor = val
-		unit = self.leftend # start from left
-		while unit is not None:
+		for unit in self:
 			if unit.phys_dim != 0:
-				unit.tensor[:,:,0] = val**(1/self.length) * numpy.eye(unit.left_dim, unit.right_dim) # set eye to the first physical slice
+				unit.tensor[:,:,0] = val**(1/self.depth) * numpy.eye(unit.left_dim, unit.right_dim) # set eye to the first physical slice
 				unit.tensor[:,:,1:] = 0. # the rest physical slices are set to zero
-			unit = unit.right # move to right
 	def pin(self, phys_env):
 		# broadcast phys_env to every tensor and pin their physical legs
-		unit = self.leftend # start from left
-		while unit is not None:
+		for unit in self:
 			unit.pin(phys_env) # pin physical environment
-			unit = unit.right # move to right
 	def fromright(self, right_env):
 		# must pin the physical legs before calling me
 		unit = self.rightend # start from right
@@ -228,19 +270,18 @@ class MPS:
 			left_env = unit.fromleft(left_env) # get new left_env
 			unit = unit.right # move to right
 		return left_env # return the last left_env
-	def evaluate(self):
+	def evaluate(self, h = None):
 		# contracting the right leg of MPS to form a double MPS. With the physical legs pinned, returns the matrix representation supported on the left double legs
-		unit = self.rightend # take the right most unit
-		while unit is not None:
-			if unit.right is None: # right most unit
+		if h is not None:
+			v = numpy.concatenate((numpy.ones(1), h)) # vector concatenation
+			self.pin(v) # pin to physical legs
+		for unit in self:
+			if unit.left is None: # for the left most unit
 				mat = unit.matrix # create a matrix holder
-			else: # for the remaining units to the left
-				mat = unit.matrix.dot(mat)
-			if unit.left is not None:
-				unit = unit.left # move to left
-			else: # has reached the left most unit
-				# construct density matrix and return
-				return mat.dot(mat.transpose())
+			else: # for the rest of units
+				mat = mat.dot(unit.matrix) # dot to mat
+		# construct density matrix and return
+		return mat.dot(mat.transpose())
 	def update(self, grad, k = 1):
 		# consider contracting the right leg of MPS to form a double MPS. Let grad be the gradient supported on the doubled left legs. Update the MPS tensors by ascending this gradient, such that: double MPS += grad (approximately). This is done by probing the gradient matrix with k rounds of random signals and each signal leads to a small update of the order 1/k. By default, k = 1.
 		for i in range(k):
@@ -249,8 +290,7 @@ class MPS:
 			x = self.fromright(z) # push z to the left
 			y = grad.dot(x) # take gradient signal
 			# now environments are prepared
-			unit = self.leftend
-			while unit is not None:
+			for unit in self:
 				if unit.left is None: # left most unit
 					unit.left_env = y # set y to the left environment
 					if unit.right is None: # the unit is both left and right end when the MPS length = 1
@@ -262,7 +302,6 @@ class MPS:
 					self.siteupdate(unit, 1./k)
 				else: # bulk unit
 					self.bondupdate(unit.left, unit, 1./k)
-				unit = unit.right # move to right
 	def siteupdate(self, unit, rate = 1.):
 		# single site update
 		unit.tensor += rate * tenprod([unit.left_env, unit.right_env, unit.phys_env]) # gradient descend with rate
@@ -313,18 +352,20 @@ class MPS:
 		unit.pin(unit.phys_env) # pin the physical leg again as the tensor had changed
 	def getP(self, h):
 		# return density matrix P as torch Variable
-		v = numpy.concatenate((numpy.ones(1), h)) # vector concatenation
-		self.pin(v) # pin to physical legs
-		out = self.evaluate() # evaluate density matrix
-		self.P.data = torch.Tensor(out) # update to P
+		P = self.evaluate(h) # evaluate density matrix
+		self.P.data = torch.Tensor(P) # update to P
 		return self.P
-	def optimize(self, V):
-		# one step of optimization of the value function V
+	def optimize(self, loss):
+		# one step of optimization of the loss function
 		self.optimizer.zero_grad() # clear gradients
-		V.backward() # back propagate gradient from value function
+		loss.backward() # back propagate gradient from the loss function
 		self.optimizer.stepby() # one step optimization, only gradient updated
 		grad = self.P.grad.data.numpy() # this is the amount of MPS update that the optimizer wants to make, we should use this signal to guide the MPS update
 		self.update(grad) # update MPS tensors
+	def M(self, h):
+		# return correlation matrix M as numpy array
+		P = self.evaluate(h)
+		return reln(P)
 # Adam optimizer for MPS -------------------
 class MPSAdam(torch.optim.Adam):
 	def __init__(self, *args, **kwargs):
@@ -365,8 +406,52 @@ class MPSAdam(torch.optim.Adam):
 # ========= ML related classes =============
 # Generative Model -------------------------
 class GM:
-	def __init__(self):
-		pass
+	def __init__(self, L, depth, loss_fn = 'MSE'):
+		self.model = Model(L)
+		self.generator = MPS(depth, self.model.opdim)
+		self.generator.initialize(numpy.sqrt(1./self.model.opdim))
+		self.loss_fn = loss_fn
+	def sample(self):
+		h = randvec(self.model.opdim)
+		M = self.model.M(h)
+		return (h, M)
+	def predict(self, h):
+		v = numpy.concatenate((numpy.ones(1), h))
+		self.generator.pin(v)
+		self.generator.evaluate()
+	def train(self, k = 8):
+		h, M = self.sample() # draw a (h, M) pair
+		PM = torch.autograd.Variable(torch.Tensor(rexp(M))) # data P
+		for i in range(k): # k = number of gradient descents
+			PG = self.generator.getP(h) # model P
+			loss = self.loss(PM, PG) # get loss function
+			self.generator.optimize(loss) # generator optimization
+		return numpy.asscalar(loss.data.numpy())
+	def test(self, size = 8):
+		res = {'h fidelity': 0., 'M deviation': 0.}
+		for i in range(size):
+			h, M = self.sample() # draw a (h, M) pair
+			MG = self.generator.M(h)
+			res['h fidelity'] += abs(GS(MG).dot(h))
+			res['M deviation'] += numpy.sum((M - MG)**2)/self.model.opdim**2
+		return {name: val/size for name, val in res.items()}
+	def loss(self, PM, PG):
+		if self.loss_fn == 'MSE':
+			return torch.sum((PM - PG)**2)
+		elif self.loss_fn == 'KLD':
+			# create instances of cross entropy function
+			xent = Xent()
+			# for KLD, regularization is needed to ensure Tr PG = 1
+			return xent(PM, PG) + (torch.trace(PG)-1)**2
+		elif self.loss_fn == 'JSD':
+			# create instances of cross entropy function
+			xent1 = Xent()
+			xent2 = Xent()
+			xent3 = Xent()
+			PA = (PM + PG)/2
+			return xent1(PA, PA) - (xent2(PM, PM) + xent3(PG, PG))/2
+		
+
 
 
 
