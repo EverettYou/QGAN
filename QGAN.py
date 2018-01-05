@@ -8,8 +8,8 @@ def tSVD(A, max_dim = None, tol = 1.E-3):
 	# given the max bond dimension max_dim and the relative tolerance tol.
 	if max_dim is None: # if max_dim not specified
 		max_dim = min(A.shape) # set it to the compact dimension
-	# compute compact SVD
-	U, s, V = numpy.linalg.svd(A, full_matrices = False)
+	# compute SVD
+	U, s, V = torch.svd(A)
 	# determine truncation position
 	if len(s) == 0: # if singular value list empty
 		cut = 0 # cut at 0
@@ -20,10 +20,10 @@ def tSVD(A, max_dim = None, tol = 1.E-3):
 			cut -= 1 # decrease the cut by one
 		# until last element out of the zero zone
 	# make truncation according to the determined cut
-	Sq = numpy.diag(numpy.sqrt(s[:cut]))
-	U = numpy.dot(U[:, :cut], Sq)
-	V = numpy.dot(Sq, V[:cut, :])
-	return U, V, cut # return U, V and cut
+	s = s[:cut]
+	U = U[:, :cut]
+	V = V[:, :cut]
+	return U, s, V
 def tenprod(vs):
 	# normalized tensor product of a list of vectors
 	# vs = [v1, v2, ...] is a list of vectors
@@ -184,260 +184,111 @@ class Model:
 		O = numpy.real(numpy.array(list(op.mat().dot(g).dot(numpy.conj(g)) for op in self.ops)))
 		# return connected correlation
 		return C - numpy.tensordot(O, O, axes = 0)
+	def sample(self):
+		# draw a random sample
+		h = randvec(self.opdim)
+		M = self.M(h)
+		return (h, M)
 # ========== MPS related classes ===========
 # MPS unit class ---------------------------
-# tensor legs arrangement: (left, right, phys)
 class MPSunit:
-	def __init__(self, tensor):
-		self.tensor = tensor
-		self.left = None
-		self.right = None
-		self.left_dim, self.right_dim, self.phys_dim = tensor.shape
+	def __init__(self, dim):
+		self.dim = dim # dim of operator space
+		sqrdim = numpy.sqrt(dim) # square root dimension
+		# T tensor - auxiliary space operator
+		# s vector - singular values
+		# E matrix - physical space encoder
+		self.T = torch.eye(dim).div_(sqrdim).expand(1, -1, -1).permute(1,2,0)
+		self.s = torch.ones(1).mul_(sqrdim)
+		self.E = torch.zeros(dim + 1, 1)
+		self.E[0,0] = 1.
+		# create a Variable for optimization
+		self.mat = torch.autograd.Variable(torch.eye(dim), requires_grad = True)
+		self.push(torch.zeros(dim)) # make an initial push
 	def __repr__(self):
-		return '[MPS unit %d×%d×%d]'%(self.left_dim, self.right_dim, self.phys_dim)
-	def pin(self, phys_env):
-		# pin the physical leg to phys_env
-		self.phys_env = phys_env # keep the physical environment
-		self.matrix = self.tensor.dot(phys_env)
-		return self.matrix
-	def fromright(self, right_env):
-		self.right_env = right_env # keep input in right environment
-		return self.matrix.dot(right_env)
-	def fromleft(self, left_env):
-		self.left_env = left_env # keep input in left environment
-		return self.matrix.transpose().dot(left_env)
+		return '[MPS unit internal dim %d]'%len(self.s)
+	def push(self, h):
+		# vector concatenation
+		self.v = torch.cat((torch.ones(1), h))
+		# push v through, resulting in mat0
+		self.mat0 = self.T.matmul(self.s * self.E.t().mv(self.v))
+		# clone mat0 to mat
+		self.mat.data = self.mat0.clone()
+		return self.mat
+	def update(self):
+		dmat = self.mat.data - self.mat0 # get difference of mat
+		dvec = dmat.view(self.dim**2) # vector form of dmat
+		TMat = self.T.view(self.dim**2, -1) # reshape T tensor
+		TExt = torch.cat((TMat, dvec.expand(1, -1).t()), dim = 1) # + dvec
+		QT, RT = torch.qr(TExt) # QR for T
+		vn = self.v/torch.sum(self.v**2)
+		EExt = torch.cat((self.E, vn.expand(1, -1).t()), dim = 1) # E extend
+		QE, RE = torch.qr(EExt) # QR for E
+		S = torch.diag(torch.cat((self.s, torch.ones(1)))) # S mat
+		U, self.s, V = tSVD(RE.mm(S).mm(RT.t()))
+		self.T = QT.mm(V).view(self.dim, self.dim, -1)
+		self.E = QE.mm(U)
 # MPS class --------------------------------
-# specialized to the double ended MPS that looks like TTTTT
 class MPS:
-	def __init__(self, depth, dim, width = 8, lr = 0.002):
-		self.depth = depth # MPS chain length
-		# dim must match model's operator space dimension
-		self.left_dim = dim
-		self.right_dim = dim
-		self.phys_dim = dim + 1
-		self.max_dim = width # max bond dimension
-		self.leftend = None
-		self.rightend = None
-		self.assemble()
-		self.P = torch.autograd.Variable(torch.zeros(dim, dim), requires_grad = True)
-		self.optimizer = MPSAdam([self.P], lr = lr) # optimizer
+	def __init__(self, depth, dim):
+		self.depth = depth # MPS chain depth (length)
+		self.dim = dim # dim must match operator space dimension
+		self.units = [MPSunit(dim) for i in range(depth)]
+		self.params = [unit.mat for unit in self.units]
 	def __repr__(self):
-		return '[MPS of shape %d×(%d^%d)×%d]'%(self.left_dim, self.phys_dim, self.depth, self.right_dim)
-	def __iter__(self):
-		# make MPS an iterator such that units can iterate through in for loop
-		unit = self.leftend
-		while unit is not None:
-			yield unit
-			unit = unit.right
-	def assemble(self):
-		# set an default auxiliary dimension
-		dim = min(max(self.left_dim, self.right_dim), self.max_dim)
-		for i in range(self.depth):
-			if i == 0: # left end unit
-				unit = MPSunit(numpy.empty((self.left_dim, dim, self.phys_dim)))
-				self.leftend = unit
-			elif i == self.depth - 1: # right end unit
-				unit.right = MPSunit(numpy.empty((dim, self.right_dim, self.phys_dim)))
-				unit.right.left = unit
-				unit = unit.right
-			else: # bulk unit
-				unit.right = MPSunit(numpy.empty((dim, dim, self.phys_dim)))
-				unit.right.left = unit
-				unit = unit.right
-			if i == self.depth - 1:
-				self.rightend = unit
-	def initialize(self, val):
-		# initialize MPS such that when all physical legs are pinned to [1,0,0,...], the MPS is simply a two-way multiplier with multiplication factor = val
-		for unit in self:
-			if unit.phys_dim != 0:
-				unit.tensor[:,:,0] = val**(1/self.depth) * numpy.eye(unit.left_dim, unit.right_dim) # set eye to the first physical slice
-				unit.tensor[:,:,1:] = 0. # the rest physical slices are set to zero
-	def pin(self, phys_env):
-		# broadcast phys_env to every tensor and pin their physical legs
-		for unit in self:
-			unit.pin(phys_env) # pin physical environment
-	def fromright(self, right_env):
-		# must pin the physical legs before calling me
-		unit = self.rightend # start from right
-		while unit is not None:
-			right_env = unit.fromright(right_env) # get new right_env
-			unit = unit.left # move to left
-		return right_env # return the last right_env
-	def fromleft(self, left_env):
-		# must pin the physical legs before calling me
-		unit = self.leftend  # start from left
-		while unit is not None:
-			left_env = unit.fromleft(left_env) # get new left_env
-			unit = unit.right # move to right
-		return left_env # return the last left_env
-	def evaluate(self, h = None):
-		# contracting the right leg of MPS to form a double MPS. With the physical legs pinned, returns the matrix representation supported on the left double legs
-		if h is not None:
-			v = numpy.concatenate((numpy.ones(1), h)) # vector concatenation
-			self.pin(v) # pin to physical legs
-		for unit in self:
-			if unit.left is None: # for the left most unit
-				mat = unit.matrix # create a matrix holder
-			else: # for the rest of units
-				mat = mat.dot(unit.matrix) # dot to mat
-		# construct density matrix and return
-		return mat.dot(mat.transpose())
-	def update(self, grad, k = 1):
-		# consider contracting the right leg of MPS to form a double MPS. Let grad be the gradient supported on the doubled left legs. Update the MPS tensors by ascending this gradient, such that: double MPS += grad (approximately). This is done by probing the gradient matrix with k rounds of random signals and each signal leads to a small update of the order 1/k. By default, k = 1.
-		for i in range(k):
-			# sample a random vector with norm = sqrt(right_dim), s.t. when z is averaged over, the density matrix is an identity matrix
-			z = numpy.sqrt(self.right_dim) * randvec(self.right_dim)
-			x = self.fromright(z) # push z to the left
-			y = grad.dot(x) # take gradient signal
-			# now environments are prepared
-			for unit in self:
-				if unit.left is None: # left most unit
-					unit.left_env = y # set y to the left environment
-					if unit.right is None: # the unit is both left and right end when the MPS length = 1
-						self.siteupdate(unit, 2./k) # site update by 2/k
-					else:
-						self.siteupdate(unit, 1./k) # site update by 1/k
-				elif unit.right is None: # right most unit
-					self.bondupdate(unit.left, unit, 1./k)
-					self.siteupdate(unit, 1./k)
-				else: # bulk unit
-					self.bondupdate(unit.left, unit, 1./k)
-	def siteupdate(self, unit, rate = 1.):
-		# single site update
-		unit.tensor += rate * tenprod([unit.left_env, unit.right_env, unit.phys_env]) # gradient descend with rate
-		if unit.right is None: # for the right end unit
-			self.relatent() # rearrange latent space
-		else: # for bulk units
-			unit.pin(unit.phys_env) # pin the physical leg again since the tensor has changed
-			unit.right.left_env = unit.fromleft(unit.left_env) # update the left environment of its right unit
-	def bondupdate(self, left_unit, right_unit, rate = 1.):
-		# forming bond tensor
-		bond_tensor = numpy.tensordot(left_unit.tensor, right_unit.tensor, axes = ((1),(0)))
-		# gradient descend of bond tensor
-		bond_tensor += rate * tenprod([left_unit.left_env, left_unit.phys_env, right_unit.right_env, right_unit.phys_env])
-		# reshape bond tensor to matrix for SVD
-		left_dim = left_unit.left_dim * left_unit.phys_dim
-		right_dim = right_unit.right_dim * right_unit.phys_dim
-		bond_matrix = numpy.reshape(bond_tensor, (left_dim, right_dim))
-		# perform truncated SVD, return U, V and actual bond dimension
-		U, V, dim = tSVD(bond_matrix, max_dim = self.max_dim)
-		# set the bond dimension to neighboring units
-		left_unit.right_dim = dim
-		right_unit.left_dim = dim
-		# update tensors
-		shape = (left_unit.left_dim, left_unit.phys_dim, left_unit.right_dim)
-		left_unit.tensor = numpy.swapaxes(numpy.reshape(U, shape), 1, 2)
-		shape = (right_unit.left_dim, right_unit.right_dim, right_unit.phys_dim)
-		right_unit.tensor = numpy.reshape(V, shape)
-		# pins physical leg of the left unit
-		left_unit.pin(left_unit.phys_env)
-		# update left environment of right unit
-		right_unit.left_env = left_unit.fromleft(left_unit.left_env)
-	def relatent(self):
-		# rearrange the latent space basis
-		unit = self.rightend # take the right end unit
-		# self contraction by right leg
-		block_tensor = numpy.tensordot(unit.tensor, unit.tensor, axes = ((1),(1)))
-		dim = unit.left_dim * unit.phys_dim # calculate total dimension
-		block_matrix = numpy.reshape(block_tensor, (dim, dim)) # reshape to matrix for diagonalization
-		w, U = numpy.linalg.eigh(block_matrix)
-		# w will follow the ascending order
-		# truncate to the right dimension (removing zero modes only)
-		w = w[-unit.right_dim:]
-		U = U[:, -unit.right_dim:]
-		U = U.dot(numpy.diag(numpy.sqrt(w))) # rescaling
-		# update the tensor
-		shape = (unit.left_dim, unit.phys_dim, unit.right_dim)
-		unit.tensor = numpy.swapaxes(numpy.reshape(U, shape), 1, 2)
-		unit.pin(unit.phys_env) # pin the physical leg again as the tensor had changed
-	def getP(self, h):
-		# return density matrix P as torch Variable
-		P = self.evaluate(h) # evaluate density matrix
-		self.P.data = torch.Tensor(P) # update to P
-		return self.P
-	def optimize(self, loss):
-		# one step of optimization of the loss function
-		self.optimizer.zero_grad() # clear gradients
-		loss.backward() # back propagate gradient from the loss function
-		self.optimizer.stepby() # one step optimization, only gradient updated
-		grad = self.P.grad.data.numpy() # this is the amount of MPS update that the optimizer wants to make, we should use this signal to guide the MPS update
-		self.update(grad) # update MPS tensors
+		return '[MPS depth %d, dim %d]'%(self.depth, self.dim)
+	def mul(self, val):
+		# multiply P matrix by val
+		for unit in self.units:
+			unit.s.mul_(val**(0.5/self.depth))
+	def P(self, h):
+		# prepare an identity matrix A
+		A = torch.autograd.Variable(torch.eye(self.dim))
+		for unit in self.units:
+			A = A.mm(unit.push(h)) # right multiply by MPS matrices
+		P = A.mm(A.t()) # construct P matrix
+		return P
 	def M(self, h):
-		# return correlation matrix M as numpy array
-		P = self.evaluate(h)
+		P = self.P(h).data.numpy()
 		return reln(P)
-# Adam optimizer for MPS -------------------
-class MPSAdam(torch.optim.Adam):
-	def __init__(self, *args, **kwargs):
-		super().__init__(*args, **kwargs)
-	def stepby(self, closure = None):
-		# Performs a single optimization step.
-		# only updates gradient signal of the parameters 
-		loss = None
-		if closure is not None:
-			loss  = closure()
-		for group in self.param_groups:
-			for p in group['params']:
-				if p.grad is None:
-					continue
-				grad = p.grad.data
-				state = self.state[p]
-				# State initialization
-				if len(state) == 0:
-					state['step'] = 0
-					# Exponential moving average of gradient values
-					state['exp_avg'] = torch.zeros_like(p.data)
-					# Exponential moving average of squared gradient values
-					state['exp_avg_sq'] = torch.zeros_like(p.data)
-				exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-				beta1, beta2 = group['betas']
-				state['step'] += 1
-				if group['weight_decay'] != 0:
-					grad = grad.add(group['weight_decay'], p.data)
-				# Decay the first and second moment running average coefficient
-				exp_avg.mul_(beta1).add_(1 - beta1, grad)
-				exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
-				denom = exp_avg_sq.sqrt().add_(group['eps'])
-				bias_correction1 = 1 - beta1 ** state['step']
-				bias_correction2 = 1 - beta2 ** state['step']
-				step_size = group['lr'] * numpy.sqrt(bias_correction2) / bias_correction1
-				p.grad.data = -step_size * exp_avg / denom
-		return loss
+	def update(self):
+		# update every MPS unit
+		for unit in self.units:
+			unit.update()
 # ========= ML related classes =============
 # Generative Model -------------------------
 class GM:
-	def __init__(self, L, depth, loss_fn = 'MSE'):
+	def __init__(self, L, depth, loss_fn = 'MSE', lr = 0.002):
 		self.model = Model(L)
-		self.generator = MPS(depth, self.model.opdim)
-		self.generator.initialize(numpy.sqrt(1./self.model.opdim))
+		self.dim = self.model.opdim
+		self.generator = MPS(depth, self.dim)
+		self.generator.mul(numpy.sqrt(1./self.dim))
+		self.optimizer = torch.optim.SGD(self.generator.params, lr)
 		self.loss_fn = loss_fn
-	def sample(self):
-		h = randvec(self.model.opdim)
-		M = self.model.M(h)
-		return (h, M)
-	def predict(self, h):
-		v = numpy.concatenate((numpy.ones(1), h))
-		self.generator.pin(v)
-		self.generator.evaluate()
 	def train(self, k = 8):
-		h, M = self.sample() # draw a (h, M) pair
+		h, M = self.model.sample() # draw a (h, M) pair
+		h = torch.Tensor(h)
 		PM = torch.autograd.Variable(torch.Tensor(rexp(M))) # data P
 		for i in range(k): # k = number of gradient descents
-			PG = self.generator.getP(h) # model P
+			PG = self.generator.P(h) # model P
 			loss = self.loss(PM, PG) # get loss function
-			self.generator.optimize(loss) # generator optimization
+			self.optimizer.zero_grad()
+			loss.backward()
+			self.optimizer.step()
+		self.generator.update()
 		return numpy.asscalar(loss.data.numpy())
 	def test(self, size = 8):
 		res = {'h fidelity': 0., 'M deviation': 0.}
 		for i in range(size):
-			h, M = self.sample() # draw a (h, M) pair
+			h, M = self.model.sample() # draw a (h, M) pair
+			h = torch.Tensor(h)
 			MG = self.generator.M(h)
 			res['h fidelity'] += abs(GS(MG).dot(h))
-			res['M deviation'] += numpy.sum((M - MG)**2)/self.model.opdim**2
+			res['M deviation'] += numpy.sum((M - MG)**2)/self.dim**2
 		return {name: val/size for name, val in res.items()}
 	def loss(self, PM, PG):
 		if self.loss_fn == 'MSE':
-			return torch.sum((PM - PG)**2)
+			return torch.dist(PM, PG)
 		elif self.loss_fn == 'KLD':
 			# create instances of cross entropy function
 			xent = Xent()
